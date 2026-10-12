@@ -3,6 +3,7 @@ pose_estimator.py — MediaPipe Pose behaviour classification.
 
 Classifies each detected person's pose into one of:
   - 'standing'   : upright, normal
+  - 'sitting'    : seated on a chair / stool / ledge
   - 'crouching'  : bent low (e.g. hiding, tampering)
   - 'lying'      : horizontal on the ground (fallen / incapacitated)
   - 'unknown'    : not enough landmarks visible
@@ -14,7 +15,10 @@ Classification heuristics:
   1. Lying: torso angle from vertical > LYING_TORSO_ANGLE  OR
             bbox width/height > LYING_ASPECT_RATIO
   2. Crouching: hip-to-ankle distance / shoulder-to-hip distance < CROUCH_HIP_RATIO
-  3. Standing: default if not lying or crouching
+  3. Sitting vs standing: how far the hips are above the bottom of the
+     person's box (the feet), measured in torso lengths (config.FEET_*).
+     If the box is cut off by the frame edge, use ankle / knee landmarks
+     (config.STAND_ANKLE_RATIO etc.), and finally the box shape.
 """
 
 import math
@@ -30,6 +34,24 @@ except ImportError:
 import config
 
 
+def update_motion(history, t, x, y, window_s=None):
+    """
+    Track a person's foot point over time.
+
+    history: a collections.deque kept per person.  Appends (t, x, y), drops
+    entries older than the window, and returns how far the foot point has
+    moved (pixels, start of window -> now).  Returns 0.0 until at least half
+    a window of history exists, so a couple of jittery frames never count.
+    """
+    window_s = window_s or config.MOVE_WINDOW_SECONDS
+    history.append((t, x, y))
+    while history and t - history[0][0] > window_s:
+        history.popleft()
+    if t - history[0][0] < 0.5 * window_s:
+        return 0.0
+    return math.hypot(x - history[0][1], y - history[0][2])
+
+
 class PoseEstimator:
     """
     MediaPipe Pose wrapper for behaviour classification.
@@ -41,13 +63,14 @@ class PoseEstimator:
     def __init__(self):
         self._enabled = config.USE_POSE and _HAS_MEDIAPIPE
         self._pose = None
+        self.last_debug = ""          # numbers behind the last decision (for tuning)
 
         if self._enabled:
             self._mp_pose = mp.solutions.pose
             self._pose = self._mp_pose.Pose(
-                static_image_mode=False,
+                static_image_mode=True,         # each call is a different person's crop
                 model_complexity=0,        # 0 = Lite (fastest, CPU-friendly)
-                smooth_landmarks=True,
+                smooth_landmarks=False,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
@@ -125,93 +148,142 @@ class PoseEstimator:
 
         # ── Classification logic ──────────────────────────────────────────
 
-        behaviour = self._classify_from_landmarks(lm, bw, bh)
+        # bottom of the YOLO box (the feet), in crop pixels - only trusted when
+        # the person is not cut off by the bottom edge of the frame
+        feet_y = (y2 - cy1) if y2 < h - 2 else None
+        behaviour = self._classify_from_landmarks(lm, bw, bh, cw, ch, feet_y)
+        self.last_debug = self._format_debug()
 
         return behaviour, landmarks_frame
 
-    def _classify_from_landmarks(self, landmarks, bbox_w, bbox_h):
+    def _classify_from_landmarks(self, landmarks, bbox_w, bbox_h,
+                                 crop_w=None, crop_h=None, feet_y=None):
+        self._dbg = {}
+        return self._classify_core(landmarks, bbox_w, bbox_h,
+                                   crop_w, crop_h, feet_y, self._dbg)
+
+    def _format_debug(self):
+        d = getattr(self, '_dbg', {}) or {}
+        def f(k, fmt):
+            v = d.get(k)
+            return '-' if v is None else format(v, fmt)
+        return (f"{d.get('branch', '?')} A:{f('A', '.2f')} K:{f('K', '.2f')} "
+                f"F:{f('F', '.2f')} B:{f('B', '.1f')} vis:{f('AV', '.2f')}")
+
+    def _classify_core(self, landmarks, bbox_w, bbox_h,
+                       crop_w, crop_h, feet_y, dbg):
         """
         Determine pose behaviour from MediaPipe landmarks.
 
-        Uses the PoseLandmark enum indices:
-          11: LEFT_SHOULDER, 12: RIGHT_SHOULDER
-          23: LEFT_HIP, 24: RIGHT_HIP
-          27: LEFT_ANKLE, 28: RIGHT_ANKLE
+        PoseLandmark indices used:
+          11/12 shoulders, 23/24 hips, 25/26 knees, 27/28 ankles
+
+        MediaPipe landmarks are normalised to the crop, so x and y have
+        different scales.  We convert to pixels before measuring anything.
         """
         lm = landmarks
+        cw = crop_w or bbox_w
+        ch = crop_h or bbox_h
 
-        # Get key landmarks with visibility check
-        def get_lm(idx):
+        def get_lm(idx, min_vis=0.4):
             l = lm[idx]
-            if l.visibility < 0.4:
+            if l.visibility < min_vis:
                 return None
-            return (l.x, l.y)
+            return (l.x * cw, l.y * ch)          # pixel coords
 
-        l_shoulder = get_lm(11)
-        r_shoulder = get_lm(12)
-        l_hip = get_lm(23)
-        r_hip = get_lm(24)
-        l_ankle = get_lm(27)
-        r_ankle = get_lm(28)
+        def mean_pt(pts):
+            return (sum(p[0] for p in pts) / len(pts),
+                    sum(p[1] for p in pts) / len(pts))
 
-        # Need at least shoulders and hips for classification
-        shoulders = [p for p in [l_shoulder, r_shoulder] if p is not None]
-        hips = [p for p in [l_hip, r_hip] if p is not None]
-        ankles = [p for p in [l_ankle, r_ankle] if p is not None]
+        leg_vis = config.LEG_VISIBILITY_MIN
+        shoulders = [p for p in (get_lm(11), get_lm(12)) if p is not None]
+        hips      = [p for p in (get_lm(23), get_lm(24)) if p is not None]
+        knees     = [p for p in (get_lm(25, leg_vis), get_lm(26, leg_vis)) if p is not None]
+        ankles    = [p for p in (get_lm(27, leg_vis), get_lm(28, leg_vis)) if p is not None]
 
+        aspect = bbox_w / bbox_h if bbox_h > 0 else 0
+        dbg['AV'] = max(lm[27].visibility, lm[28].visibility)
+
+        # Need at least one shoulder and one hip
         if len(shoulders) < 1 or len(hips) < 1:
-            # Not enough landmarks — use aspect ratio fallback
-            aspect = bbox_w / bbox_h if bbox_h > 0 else 0
+            dbg['branch'] = 'few-landmarks'
             if aspect > config.LYING_ASPECT_RATIO:
                 return 'lying'
             return 'unknown'
 
-        # Average positions
-        shoulder_mid = (
-            sum(p[0] for p in shoulders) / len(shoulders),
-            sum(p[1] for p in shoulders) / len(shoulders),
-        )
-        hip_mid = (
-            sum(p[0] for p in hips) / len(hips),
-            sum(p[1] for p in hips) / len(hips),
-        )
+        shoulder_mid = mean_pt(shoulders)
+        hip_mid = mean_pt(hips)
 
         # ── Check 1: Lying (torso angle from vertical) ────────────────────
         dx = hip_mid[0] - shoulder_mid[0]
         dy = hip_mid[1] - shoulder_mid[1]
-        # Angle of torso from vertical (0° = upright, 90° = horizontal)
-        torso_angle = abs(math.degrees(math.atan2(abs(dx), abs(dy) + 1e-6)))
+        torso_angle = math.degrees(math.atan2(abs(dx), abs(dy) + 1e-6))
 
         if torso_angle > config.LYING_TORSO_ANGLE:
+            dbg['branch'] = 'lying-angle'
             return 'lying'
-
-        # Also check bbox aspect ratio as a backup
-        aspect = bbox_w / bbox_h if bbox_h > 0 else 0
         if aspect > config.LYING_ASPECT_RATIO:
+            dbg['branch'] = 'lying-aspect'
             return 'lying'
 
-        # ── Check 2: Crouching (hip-to-ankle vs shoulder-to-hip ratio) ────
-        if len(ankles) >= 1:
-            ankle_mid = (
-                sum(p[0] for p in ankles) / len(ankles),
-                sum(p[1] for p in ankles) / len(ankles),
-            )
-            # Distances in normalized coordinates
-            torso_len = math.hypot(
-                hip_mid[0] - shoulder_mid[0],
-                hip_mid[1] - shoulder_mid[1]
-            )
-            hip_ankle_len = math.hypot(
-                ankle_mid[0] - hip_mid[0],
-                ankle_mid[1] - hip_mid[1]
-            )
+        torso_len = math.hypot(dx, dy)
+        if torso_len < 3:                      # degenerate / far too small
+            return 'unknown'
 
-            if torso_len > 0.01:
-                ratio = hip_ankle_len / torso_len
-                if ratio < config.CROUCH_HIP_RATIO:
-                    return 'crouching'
+        if feet_y is not None:
+            dbg['F'] = (feet_y - hip_mid[1]) / torso_len     # hips -> bottom of box
+        dbg['B'] = bbox_h / torso_len
 
-        # ── Default: standing ──────────────────────────────────────────────
+        # ── Check 2a: box-based feet (primary) ────────────────────────────
+        #   The YOLO box bottom is a far more reliable "feet" position than
+        #   MediaPipe's ankle landmarks, which drift on small / distant people.
+        if config.USE_BOX_FEET and dbg.get('F') is not None:
+            f = dbg['F']
+            dbg['branch'] = 'box'
+            if f < config.FEET_CROUCH_RATIO:
+                return 'crouching'
+            if f < config.FEET_STAND_RATIO:
+                return 'sitting'
+            return 'standing'
+
+        # Vertical drops below the hips, in torso lengths
+        ankle_drop = None
+        if ankles:
+            ankle_drop = (mean_pt(ankles)[1] - hip_mid[1]) / torso_len
+        knee_drop = None
+        if knees:
+            knee_drop = (mean_pt(knees)[1] - hip_mid[1]) / torso_len
+        dbg['A'] = ankle_drop
+        dbg['K'] = knee_drop
+
+        # ── Check 2: ankles visible -> best evidence ──────────────────────
+        #   standing        : ankles far below hips   (~2 torso lengths)
+        #   sitting (chair) : ankles ~1 torso length below hips
+        #   crouching       : hips almost down at ankle level
+        if ankle_drop is not None:
+            dbg['branch'] = 'ankle'
+            if ankle_drop < config.CROUCH_HIP_RATIO:
+                return 'crouching'
+            if ankle_drop < config.STAND_ANKLE_RATIO:
+                return 'sitting'
+            return 'standing'
+
+        # ── Check 3: only knees visible (ankles cropped / hidden) ─────────
+        if knee_drop is not None:
+            dbg['branch'] = 'knee'
+            if knee_drop < 0.0:
+                return 'crouching'             # knees higher than hips
+            if knee_drop < config.SIT_KNEE_RATIO:
+                return 'sitting'               # thigh roughly horizontal
+            return 'standing'
+
+        # ── Check 4: legs not visible (behind desk/table) -> bbox shape ───
+        #   A full standing body is ~3.3+ torso lengths tall and narrow.
+        #   An upper body (or seated body) is shorter and wider.
+        dbg['branch'] = 'bbox'
+        body_ratio = bbox_h / torso_len
+        if body_ratio < config.SIT_BODY_RATIO or aspect > config.SIT_ASPECT_RATIO:
+            return 'sitting'
         return 'standing'
 
     def draw_landmarks(self, frame, landmarks, colour=(0, 255, 0)):

@@ -81,6 +81,31 @@ CROUCH_HIP_RATIO       = 0.6         # hip-to-ankle / torso ratio for "crouching
 LYING_ASPECT_RATIO     = 1.2         # bbox width/height ratio for "lying/fallen"
 LYING_TORSO_ANGLE      = 45          # torso angle from vertical for "lying"
 
+# Sitting vs standing (all vertical distances are measured in "torso lengths",
+# i.e. divided by shoulder-to-hip distance, so they work at any distance from camera)
+# Box-based feet measurement (more reliable than MediaPipe's ankle landmarks on small people):
+#   F = (bottom of person's box - hip_y) / torso length
+#   measured on this camera: seated man 1.43-1.59 (15 readings),
+#                            standing man 1.46-2.24 (mostly 1.64-1.74)
+USE_BOX_FEET           = True
+FEET_STAND_RATIO       = 1.62        # F >= this -> standing
+FEET_CROUCH_RATIO      = 0.9         # F <  this -> crouching, in between -> sitting
+
+# Motion cue: a person whose feet travel across the frame is standing/walking,
+# whatever the pose model says (a seated person's feet stay in one place).
+USE_MOTION_CUE         = True
+MOVE_WINDOW_SECONDS    = 2.0         # look at the last N seconds of video
+MOVE_MIN_PIXELS        = 35          # net foot-point movement that counts as "moving"
+STAND_ANKLE_RATIO      = 1.4         # (ankle_y - hip_y) / torso >= this -> standing.
+                                     #   standing ~1.8-2.2, sitting on chair ~0.8-1.2
+SIT_KNEE_RATIO         = 0.55        # (knee_y - hip_y) / torso < this -> thigh ~horizontal -> sitting
+SIT_BODY_RATIO         = 3.0         # fallback when legs not visible: bbox_height / torso < this -> sitting
+SIT_ASPECT_RATIO       = 0.75        # fallback when legs not visible: bbox w/h above this -> sitting
+LEG_VISIBILITY_MIN     = 0.5         # knees/ankles below this visibility are ignored
+                                     #   (MediaPipe "guesses" occluded legs, e.g. behind a desk)
+POSE_SMOOTH_FRAMES     = 5           # majority vote over last N pose results per person
+DEBUG_POSE             = True        # show the pose numbers under each label (set False when done tuning)
+
 # ── Demo mode ─────────────────────────────────────────────────────────────
 DEMO_MODE           = False           # clean overlay for presentation recording
 DEMO_OUTPUT_PATH    = "demo_output.mp4"

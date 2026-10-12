@@ -17,9 +17,11 @@ Run:
 
 import os
 import sys
+import math
 import json
 import argparse
 import warnings
+from collections import Counter, deque
 from datetime import datetime
 
 import cv2
@@ -35,7 +37,7 @@ from alerts import AlertWorker
 from evidence import EvidenceManager, blur_non_intruders
 from confirmation import TemporalConfirmer
 from tracker import Tracker, DwellTracker
-from pose_estimator import PoseEstimator
+from pose_estimator import PoseEstimator, update_motion
 from event_db import EventDB
 import severity as sev
 
@@ -164,6 +166,9 @@ def main():
     track_max_severity = {}     # {track_id: severity_level}
     confirmed_intruder_ids = set()  # track IDs confirmed as intruders this frame
     track_behaviours = {}       # {incident_id: str} last known pose
+    track_pose_history = {}     # {incident_id: deque of recent pose labels}
+    track_pose_debug = {}       # {incident_id: debug string}
+    track_foot_hist = {}        # {incident_id: deque of (time, x, y) foot points}
     ALARM_COOLDOWN_SECONDS = 5
     last_alarm_time = None
 
@@ -342,6 +347,12 @@ def main():
                     # ═══════════════════════════════════════════════════════
                     incident_id = str(track_id) if track_id is not None else entity_key
 
+                    # ── Motion cue: is this person's foot point travelling? ─
+                    fh = track_foot_hist.setdefault(incident_id, deque())
+                    move_px = update_motion(fh, video_time,
+                                            test_point[0], test_point[1])
+                    is_moving = config.USE_MOTION_CUE and move_px >= config.MOVE_MIN_PIXELS
+
                     # ── Dwell time ─────────────────────────────────────────
                     if config.USE_TRACKING and track_id is not None:
                         dwell_s = dwell_tracker.update(
@@ -363,7 +374,27 @@ def main():
                         behaviour, pose_landmarks = pose_estimator.classify(
                             frame, x1, y1, x2, y2
                         )
+                        # A person walking across the room is not sitting
+                        moved_override = False
+                        if is_moving and behaviour == 'sitting':
+                            behaviour = 'standing'
+                            moved_override = True
+                        # Smooth: majority vote over the last few pose results
+                        # so the label doesn't flicker between sitting/standing
+                        hist = track_pose_history.setdefault(
+                            incident_id,
+                            deque(maxlen=config.POSE_SMOOTH_FRAMES))
+                        if behaviour != 'unknown':
+                            hist.append(behaviour)
+                        if hist:
+                            behaviour = Counter(hist).most_common(1)[0][0]
                         track_behaviours[incident_id] = behaviour
+                        track_pose_debug[incident_id] = (
+                            f"{pose_estimator.last_debug} mv:{move_px:.0f}"
+                            + (" MOVING" if moved_override else ""))
+                        if config.DEBUG_POSE and frame_count % 15 == 0:
+                            print(f"[PoseDebug] id={incident_id} "
+                                  f"{track_pose_debug[incident_id]}")
                     else:
                         # Use cached behaviour from last pose frame
                         behaviour = track_behaviours.get(incident_id)
@@ -376,6 +407,11 @@ def main():
                                     (x1, y2 + 18),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                                     (0, 255, 0), 1)
+                    if config.DEBUG_POSE and track_pose_debug.get(incident_id):
+                        cv2.putText(frame, track_pose_debug[incident_id],
+                                    (x1, y2 + 34),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                                    (255, 255, 255), 1)
 
                     # ── Severity ───────────────────────────────────────────
                     cur_severity, reasons = sev.compute_severity(
